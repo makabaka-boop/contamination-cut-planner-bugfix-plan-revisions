@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cleanroom
+      POSTGRES_PASSWORD: cleanroom
+      POSTGRES_DB: cleanroom
+    volumes:
+      # 命名数据卷：服务重启后方案与已采用快照仍然保留
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cleanroom -d cleanroom"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cleanroom:cleanroom@db:5432/cleanroom
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
