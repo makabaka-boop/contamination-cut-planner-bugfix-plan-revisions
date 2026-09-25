@@ -56,7 +56,7 @@ docker compose up --build
 
 | 接口 | 说明 |
 | --- | --- |
-| `PUT /plans/{plan_id}` | 保存（新建或整版替换）方案；非法负载返回 422 且**不改写**当前方案 |
+| `PUT /plans/{plan_id}` | 保存（新建或整版替换）方案；非法负载返回 422 且**不改写**当前方案；并发保存冲突返回 409 且**不改写**当前方案 |
 | `GET /plans/{plan_id}` | 查询当前方案 |
 | `POST /plans/{plan_id}/computations` | 对当前方案计算最小费用隔断，返回计算记录 |
 | `GET /plans/{plan_id}/computations/{computation_id}` | 查询计算记录 |
@@ -137,12 +137,23 @@ curl http://localhost:8000/plans/demo/adoption
 | --- | --- | --- |
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON |
 | 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
-| 409 | `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` / `ADOPTION_CONFLICT` | 计算已被采用过（含已被替换下来的历史采用）/ 计算未成功 / 并发采用时当前生效结果已被他人改变，请重新查询后再采用 |
+| 409 | `PLAN_SAVE_CONFLICT` / `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` / `ADOPTION_CONFLICT` | 方案在保存期间被并发创建/修改，本次写入未生效，请重新读取后再保存 / 计算已被采用过（含已被替换下来的历史采用）/ 计算未成功 / 并发采用时当前生效结果已被他人改变，请重新查询后再采用 |
 | 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS` 等） |
 | 500 | `INTERNAL_ERROR` / `COMPUTATION_FAILED` | 服务内部错误 |
 
-非法整版、计算失败、采用不存在或已采用过的结果，都**不会**改写当前方案
-或已采用结果。
+非法整版、并发保存冲突、计算失败、采用不存在或已采用过的结果，都
+**不会**改写当前方案或已采用结果。
+
+### 并发保存与修订号唯一性
+
+方案保存采用乐观并发控制：整版替换是"仅当行仍为本事务读到的修订号
+才生效"的条件更新，并发首次创建由主键唯一约束兜底。两名调度员基于
+同一修订并发提交时，恰有一个请求被接受（修订号 +1），落败请求回滚并
+返回 `409 PLAN_SAVE_CONFLICT`——不会暴露数据库异常（500），也不会
+改写现状，修订号也不会被失败的写入落空消耗。因此每个修订号在数据库
+历史上只对应一份内容：计算记录冻结的 (`plan_revision`, `plan_payload`)
+与采用快照始终能追溯到唯一确定的版本。保存响应由本事务实际写入的值
+直接构造，提交后不再回读，被接受的内容、修订号与响应严格一一对应。
 
 ### 快照一致性与并发采用
 
@@ -180,6 +191,11 @@ pytest
   （SQLite 自动跳过），确定性地制造两个不同成功计算的并发首次采用，
   核对一胜（200）一负（409 `ADOPTION_CONFLICT`）、无 500/无误报、
   成功响应与最终记录一致、历史采用次数为 1，另含多轮并行对拍。
+- `tests/test_plan_concurrency_pg.py`：**仅在真实 PostgreSQL 下运行**
+  （SQLite 自动跳过），在提交点确定性挂起领先事务，核对并发首次创建
+  与并发覆盖均为一胜（200）一负（409 `PLAN_SAVE_CONFLICT`）、无 500、
+  失败写入不改变现有方案、响应与本次提交一一对应、随后计算与采用
+  追溯到唯一确定的版本，另含多轮并行对拍。
 
 测试默认使用 SQLite 内存库；设置 `TEST_DATABASE_URL` 可指向 PostgreSQL
 进行对拍。

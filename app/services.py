@@ -2,6 +2,13 @@
 
 事务约定：
 - 方案校验通过后才写库，非法整版不会改写当前方案；
+- 方案保存是乐观并发控制：整版替换仅当行仍为本事务读到的修订号时
+  才生效（条件更新），并发首次创建由主键唯一约束兜底；落败的保存
+  一律回滚并以 409 PLAN_SAVE_CONFLICT 拒绝——不改写现状，也绝不把
+  数据库异常暴露为 500。由此每个修订号在数据库历史上只对应一份
+  内容，计算与采用始终能追溯到唯一确定的版本；
+- 保存响应由本事务实际写入的值直接构造，提交后不再回读，保证被
+  接受的内容、修订号与响应一一对应；
 - 计算失败仅落一条 FAILED 记录，不触碰方案与已采用结果；
 - 成功计算在创建时冻结计算时刻的方案修订号、方案负载与最小割结果，
   三者共同组成不可混合的快照；采用时只使用该冻结快照，绝不读取
@@ -17,12 +24,31 @@
 
 import uuid
 from datetime import datetime, timezone
+from typing import NamedTuple
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
 from . import models
 from .errors import ApiError
 from .flow import solve_min_cut
+
+
+class SavedPlan(NamedTuple):
+    """一次被接受的保存：内容、修订号与响应一一对应的确定结果。"""
+
+    plan_id: str
+    revision: int
+    payload: dict
+
+
+def _plan_save_conflict(plan_id):
+    return ApiError(
+        409,
+        "PLAN_SAVE_CONFLICT",
+        f"plan {plan_id!r} was saved concurrently; "
+        "re-read the current plan and retry the save",
+    )
 
 
 def get_plan_or_404(db, plan_id):
@@ -33,17 +59,45 @@ def get_plan_or_404(db, plan_id):
 
 
 def save_plan(db, plan_id, canonical_payload):
-    """保存（新建或整版替换）方案；payload 必须先通过校验。"""
+    """保存（新建或整版替换）方案；payload 必须先通过校验。
+
+    并发约定（乐观并发控制）：
+    - 整版替换是条件更新：仅当 plans 行仍是本事务读到的修订号时才
+      写入，否则回滚并以 409 PLAN_SAVE_CONFLICT 拒绝——两名调度员
+      基于同一修订并发提交时恰有一人被接受，落败者不改写任何内容，
+      修订号也不会被失败的写入落空消耗；
+    - 并发首次创建由主键唯一约束兜底：落败的 INSERT 同样转换为
+      409 PLAN_SAVE_CONFLICT，绝不把数据库异常暴露给调用方；
+    - 因此每个修订号只对应一份内容，计算记录冻结的
+      (plan_revision, plan_payload) 始终能追溯到唯一确定的版本；
+    - 响应由本事务实际写入的值直接构造，提交后不再回读，保证
+      "被接受的内容、修订号与响应"严格一一对应。
+    """
     plan = db.get(models.Plan, plan_id)
     if plan is None:
-        plan = models.Plan(plan_id=plan_id, revision=1, payload=canonical_payload)
-        db.add(plan)
-    else:
-        plan.revision += 1
-        plan.payload = canonical_payload
+        db.add(models.Plan(plan_id=plan_id, revision=1, payload=canonical_payload))
+        try:
+            db.commit()
+        except IntegrityError:
+            # 并发首次创建：主键冲突说明对方已胜出，本请求不写任何内容
+            db.rollback()
+            raise _plan_save_conflict(plan_id)
+        return SavedPlan(plan_id, 1, canonical_payload)
+
+    new_revision = plan.revision + 1
+    result = db.execute(
+        update(models.Plan)
+        .where(models.Plan.plan_id == plan_id)
+        .where(models.Plan.revision == plan.revision)
+        .values(revision=new_revision, payload=canonical_payload)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        # 读到的修订已被并发保存推进：本次写入未发生，现状不变
+        db.rollback()
+        raise _plan_save_conflict(plan_id)
     db.commit()
-    db.refresh(plan)
-    return plan
+    return SavedPlan(plan_id, new_revision, canonical_payload)
 
 
 def compute(db, plan_id):
