@@ -56,7 +56,7 @@ docker compose up --build
 
 | 接口 | 说明 |
 | --- | --- |
-| `PUT /plans/{plan_id}` | 保存（新建或整版替换）方案；非法负载返回 422 且**不改写**当前方案 |
+| `PUT /plans/{plan_id}` | 保存（新建或整版替换）方案；可携带 `expected_revision` 声明读取到的修订号，仅当当前修订号一致才接受（乐观并发控制，冲突返回 409）；非法负载返回 422 且**不改写**当前方案 |
 | `GET /plans/{plan_id}` | 查询当前方案 |
 | `POST /plans/{plan_id}/computations` | 对当前方案计算最小费用隔断，返回计算记录 |
 | `GET /plans/{plan_id}/computations/{computation_id}` | 查询计算记录 |
@@ -86,6 +86,24 @@ curl -X PUT http://localhost:8000/plans/demo \
 ```json
 {"plan_id": "demo", "revision": 1, "plan": {"zones": ["..."], "segments": ["..."], "sources": ["SRC1", "SRC2"], "protections": ["SAFE1", "SAFE2"]}}
 ```
+
+带修订号令牌的整版替换（仅当当前修订号仍为 `1` 时才接受）：
+
+```bash
+curl -X PUT http://localhost:8000/plans/demo \
+  -H 'content-type: application/json' \
+  -d '{
+    "expected_revision": 1,
+    "zones": ["..."],
+    "segments": ["..."],
+    "sources": ["SRC1", "SRC2"],
+    "protections": ["SAFE1", "SAFE2"]
+  }'
+```
+
+成功时修订号原子推进为 `2`；若读取后方案已被他人修改，则返回
+`409 REVISION_CONFLICT`（`details[].code = REVISION_MISMATCH`），
+本次写入回滚、不改写现有方案，调用方重新读取后按新修订号重试即可。
 
 计算最小费用隔断：
 
@@ -137,12 +155,35 @@ curl http://localhost:8000/plans/demo/adoption
 | --- | --- | --- |
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON |
 | 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
+| 409 | `REVISION_CONFLICT` | 保存冲突，`details[].code` 区分：`PLAN_ALREADY_EXISTS`（并发首次创建同一方案，落败请求）/ `REVISION_MISMATCH`（携带的 `expected_revision` 已过期，方案在读取后被他人修改）；重新读取当前方案与修订号后再提交 |
 | 409 | `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` / `ADOPTION_CONFLICT` | 计算已被采用过（含已被替换下来的历史采用）/ 计算未成功 / 并发采用时当前生效结果已被他人改变，请重新查询后再采用 |
-| 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS` 等） |
+| 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS`、`INVALID_EXPECTED_REVISION` 等） |
 | 500 | `INTERNAL_ERROR` / `COMPUTATION_FAILED` | 服务内部错误 |
 
-非法整版、计算失败、采用不存在或已采用过的结果，都**不会**改写当前方案
-或已采用结果。
+非法整版、计算失败、采用不存在或已采用过的结果，以及并发保存的落败
+写入，都**不会**改写当前方案或已采用结果。
+
+### 修订号与并发保存
+
+每次被接受的保存都对应唯一的修订号（新建为 `1`，此后每次接受的整版
+替换原子地 `+1`），且成功响应中的修订号与方案内容就是本次事务提交的
+同一行——不存在"两个请求返回同一新修订号"或"响应与本次提交不符"。
+
+- 请求体中的 `expected_revision` 是可选的乐观并发令牌：为正整数时，
+  保存退化为单条原子的条件 UPDATE
+  （`SET revision = revision + 1 ... WHERE revision = expected_revision`），
+  "比对修订号 + 写入"在数据库内一次完成。两个都读到修订 `N` 的并发
+  请求因此恰有一个被接受为 `N+1`，另一个得到
+  `409 REVISION_CONFLICT` / `REVISION_MISMATCH`；
+- 两个请求同时首次创建同一方案时，主键唯一约束保证只有一条写入成功，
+  落败事务回滚并返回 `409 REVISION_CONFLICT` / `PLAN_ALREADY_EXISTS`，
+  绝不把数据库唯一约束异常暴露成 500；
+- 不携带（或显式传 `null`）`expected_revision` 时保持旧语义：存在则
+  整版替换、否则新建。替换同样是原子的 `revision + 1`，因此并发的
+  无令牌替换也一定得到互不相同的修订号，每次响应仍与各自的提交一一
+  对应；需要"修改不被静默覆盖"的调用方应携带 `expected_revision`；
+- 计算记录冻结的 `plan_revision` 因此始终对应唯一的一份方案负载，
+  后续计算与采用都能追溯到确定版本。
 
 ### 快照一致性与并发采用
 
@@ -172,14 +213,22 @@ pytest
 - `tests/test_flow.py`：并列割取源侧最小、多源多汇、零费用割、超过
   32 位（直至 2×10¹²）的总费用、自环与提交顺序无关性。
 - `tests/test_api.py`：保存/计算/采用/查询全流程、稳定错误码、非法
-  操作不改写既有数据、结果确定性。
+  操作不改写既有数据、结果确定性，以及 `expected_revision` 乐观
+  并发令牌的串行契约（接受/冲突/404/非法令牌 422）。
 - `tests/test_snapshot.py`：计算后修订再采用时快照的方案/修订/清单/费用
   逐项冻结且能隔断快照内污染路径；采用被替换后旧计算不可重用；历史采用
   次数核对；冲突不改写当前方案与生效快照。
 - `tests/test_concurrency_pg.py`：**仅在真实 PostgreSQL 下运行**
-  （SQLite 自动跳过），确定性地制造两个不同成功计算的并发首次采用，
-  核对一胜（200）一负（409 `ADOPTION_CONFLICT`）、无 500/无误报、
-  成功响应与最终记录一致、历史采用次数为 1，另含多轮并行对拍。
+  （SQLite 自动跳过），在数据库层确定性地卡住两次操作：
+  - 并发首次创建同一方案：一胜（200 修订 1）一负（409
+    `REVISION_CONFLICT` / `PLAN_ALREADY_EXISTS`），无 500，落败
+    写入不改写胜者方案；
+  - 并发整版覆盖（都读到同一修订）：恰一胜（修订号唯一推进，响应
+    等于其提交）一负（409 `REVISION_CONFLICT` / `REVISION_MISMATCH`），
+    落败内容不可见；随后计算与采用的版本/内容/错误结构逐项自洽；
+  - 并发首次采用不同计算：一胜（200）一负（409 `ADOPTION_CONFLICT`）、
+    无 500/无误报、成功响应与最终记录一致、历史采用次数为 1；
+  - 另含保存与采用的多轮无协调并行对拍。
 
 测试默认使用 SQLite 内存库；设置 `TEST_DATABASE_URL` 可指向 PostgreSQL
 进行对拍。

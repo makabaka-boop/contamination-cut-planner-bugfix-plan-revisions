@@ -19,6 +19,18 @@ EXPECTED_RESULT = {
     "cut_segments": ["p1", "p2"],
     "total_cost": 10,
 }
+# 另一版：p4 费用 7 -> 1，最小割变为切 p3+p4=6
+REVISED_PLAN = {
+    "zones": ["SRC1", "SRC2", "MID", "SAFE1", "SAFE2"],
+    "segments": [
+        {"id": "p1", "from": "SRC1", "to": "MID", "cost": 4},
+        {"id": "p2", "from": "SRC2", "to": "MID", "cost": 6},
+        {"id": "p3", "from": "MID", "to": "SAFE1", "cost": 5},
+        {"id": "p4", "from": "MID", "to": "SAFE2", "cost": 1},
+    ],
+    "sources": ["SRC1", "SRC2"],
+    "protections": ["SAFE1", "SAFE2"],
+}
 
 
 def put_plan(client, plan_id, plan):
@@ -52,6 +64,94 @@ def test_resave_bumps_revision(client):
     put_plan(client, "plan-a", VALID_PLAN)
     resp = put_plan(client, "plan-a", VALID_PLAN)
     assert resp.json()["revision"] == 2
+
+
+# ---------- 修订号令牌（乐观并发控制）：串行契约，两个后端均运行 ----------
+
+def _put_with_expected_revision(client, plan_id, plan, expected_revision):
+    body = dict(plan)
+    body["expected_revision"] = expected_revision
+    return client.put(f"/plans/{plan_id}", json=body)
+
+
+def test_conditional_replace_accepted_when_revision_matches(client):
+    put_plan(client, "plan-occ", VALID_PLAN)
+    resp = _put_with_expected_revision(client, "plan-occ", REVISED_PLAN, 1)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["revision"] == 2
+    assert body["plan"] == REVISED_PLAN
+    # 成功响应与随后查询到的行逐项一致
+    assert client.get("/plans/plan-occ").json() == body
+
+
+def test_conditional_replace_rejected_when_revision_stale(client):
+    put_plan(client, "plan-occ", VALID_PLAN)
+    assert _put_with_expected_revision(
+        client, "plan-occ", REVISED_PLAN, 1
+    ).status_code == 200
+    # 另一调度员仍基于修订 1 提交：必须被明确冲突拒绝
+    resp = _put_with_expected_revision(
+        client, "plan-occ", VALID_PLAN, 1
+    )
+    assert resp.status_code == 409
+    error = resp.json()["error"]
+    assert error["code"] == "REVISION_CONFLICT"
+    assert {d["code"] for d in error["details"]} == {"REVISION_MISMATCH"}
+    # 落败写入不得改变现有方案：修订号与负载都停留在第 2 版
+    got = client.get("/plans/plan-occ").json()
+    assert got["revision"] == 2
+    assert got["plan"] == REVISED_PLAN
+
+
+def test_conditional_replace_on_missing_plan_is_404(client):
+    resp = _put_with_expected_revision(client, "ghost", VALID_PLAN, 1)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "PLAN_NOT_FOUND"
+
+
+def test_explicit_null_expected_revision_keeps_legacy_semantics(client):
+    body = dict(VALID_PLAN)
+    body["expected_revision"] = None
+    resp = client.put("/plans/plan-null", json=body)
+    assert resp.status_code == 200
+    assert resp.json()["revision"] == 1
+    resp = client.put("/plans/plan-null", json=body)
+    assert resp.status_code == 200
+    assert resp.json()["revision"] == 2
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, "1", 1.5, True, 2.0])
+def test_invalid_expected_revision_rejected_without_write(client, bad_value):
+    put_plan(client, "plan-iv", VALID_PLAN)
+    resp = _put_with_expected_revision(
+        client, "plan-iv", REVISED_PLAN, bad_value
+    )
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert "INVALID_EXPECTED_REVISION" in {d["code"] for d in error["details"]}
+    # 校验失败不改写方案
+    got = client.get("/plans/plan-iv").json()
+    assert got["revision"] == 1
+    assert got["plan"] == VALID_PLAN
+
+
+def test_accepted_save_response_matches_its_own_submission(client):
+    """连续接受两次替换：每次响应的修订号与负载都属于本次提交。"""
+    put_plan(client, "plan-faithful", VALID_PLAN)
+    first = _put_with_expected_revision(client, "plan-faithful", REVISED_PLAN, 1)
+    assert first.status_code == 200
+    assert first.json()["revision"] == 2
+    assert first.json()["plan"] == REVISED_PLAN
+    second = _put_with_expected_revision(client, "plan-faithful", VALID_PLAN, 2)
+    assert second.status_code == 200
+    assert second.json()["revision"] == 3
+    assert second.json()["plan"] == VALID_PLAN
+    assert client.get("/plans/plan-faithful").json() == second.json()
+    # 每个修订号唯一对应一份负载：第 2 版的计算记录不被第 3 版污染
+    c1 = compute(client, "plan-faithful").json()
+    assert c1["plan_revision"] == 3
 
 
 def test_plan_without_zones_derives_them(client):

@@ -356,3 +356,283 @@ def test_parallel_first_adoption_fuzz(client, round_no):
         assert final_snapshot["plan_revision"] == source["plan_revision"]
         assert final_snapshot["plan"] == expected_plan
         assert final_snapshot["result"] == source["result"]
+
+
+# ===========================================================================
+# 并发保存验收：并发首次创建、并发整版覆盖，以及随后的计算与采用。
+#
+# 并发的真实性由 PostgreSQL 行锁/唯一约束保证（与并发采用同样的做法）：
+# - 覆盖：领先者的条件 UPDATE 已执行（持有 plans 行锁）但在提交点被
+#   gate 挂住，确认落后者已阻塞在同一行的锁竞争上后再放行提交，两次
+#   保存因此确定地在锁上相遇；
+# - 创建：两个会话的提交由 Barrier 同步放行，两条 INSERT 确定地在
+#   主键唯一约束上相遇，一条成功、另一条收到唯一冲突。
+# ===========================================================================
+
+# 第三种方案：p1 费用 4 -> 1，最小割变为切 p1+p2=7，与前两版均不同
+FOLLOWER_PLAN = {
+    "zones": ["SRC1", "SRC2", "MID", "SAFE1", "SAFE2"],
+    "segments": [
+        {"id": "p1", "from": "SRC1", "to": "MID", "cost": 1},
+        {"id": "p2", "from": "SRC2", "to": "MID", "cost": 6},
+        {"id": "p3", "from": "MID", "to": "SAFE1", "cost": 5},
+        {"id": "p4", "from": "MID", "to": "SAFE2", "cost": 7},
+    ],
+    "sources": ["SRC1", "SRC2"],
+    "protections": ["SAFE1", "SAFE2"],
+}
+
+
+def _save_in_thread(pid, payload, expected_revision, pre_commit=None):
+    """在独立线程/会话中执行一次保存，返回 (线程, 结果字典)。
+
+    pre_commit 在该会话真正提交前调用一次：可用于在持锁未提交状态
+    下挂起（gate），或让多个会话在提交点同步（Barrier）。
+    """
+    outcome = {"payload": payload, "expected_revision": expected_revision}
+
+    def run():
+        db = SessionLocal()
+        if pre_commit is not None:
+            original_commit = db.commit
+
+            def hooked_commit(*args, **kwargs):
+                pre_commit()
+                return original_commit(*args, **kwargs)
+
+            db.commit = hooked_commit
+        try:
+            plan = services.save_plan(db, pid, payload, expected_revision)
+            outcome["status"] = 200
+            outcome["view"] = {
+                "plan_id": plan.plan_id,
+                "revision": plan.revision,
+                "plan": plan.payload,
+            }
+        except ApiError as exc:
+            outcome["status"] = exc.status_code
+            outcome["code"] = exc.code
+            outcome["message"] = exc.message
+            outcome["details"] = exc.details
+        except Exception as exc:  # 任何非预期错误都让测试显式失败
+            outcome["status"] = 500
+            outcome["code"] = "INTERNAL_ERROR"
+            outcome["message"] = repr(exc)
+        finally:
+            db.close()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, outcome
+
+
+def test_concurrent_create_same_plan_is_clear_conflict(client):
+    """两人同时首次创建同一方案：一胜（200 rev 1），落败者得到明确的
+    409 REVISION_CONFLICT（PLAN_ALREADY_EXISTS），而不是数据库异常；
+    落败写入不得改变胜者方案，随后计算与采用追溯确定版本。"""
+    pid = "concurrent-create"
+
+    # 两个会话各自的提交先在 Barrier 处会合，再同时放行，确保两条
+    # INSERT 在主键唯一约束上真正相撞
+    barrier = threading.Barrier(2)
+    t1, o1 = _save_in_thread(pid, VALID_PLAN, None, pre_commit=lambda: barrier.wait(15))
+    t2, o2 = _save_in_thread(
+        pid, REVISED_PLAN, None, pre_commit=lambda: barrier.wait(15)
+    )
+    t1.join(timeout=20)
+    t2.join(timeout=20)
+    assert not t1.is_alive() and not t2.is_alive(), "worker thread hung"
+
+    winners = [o for o in (o1, o2) if o["status"] == 200]
+    losers = [o for o in (o1, o2) if o["status"] != 200]
+    assert len(winners) == 1 and len(losers) == 1, (o1, o2)
+    winner, loser = winners[0], losers[0]
+
+    # ---- 胜者：200、修订号 1、响应即本次提交的内容 ----
+    assert winner["view"]["revision"] == 1
+    assert winner["view"]["plan"] == winner["payload"]
+
+    # ---- 落败者：明确冲突，绝不暴露 500/数据库异常 ----
+    assert loser["status"] == 409, loser
+    assert loser["code"] == "REVISION_CONFLICT", loser
+    assert [d["code"] for d in loser["details"]] == ["PLAN_ALREADY_EXISTS"], loser
+
+    # ---- 落败写入未改变任何数据：最终方案即胜者内容，修订号仍为 1 ----
+    final = client.get(f"/plans/{pid}")
+    assert final.status_code == 200
+    assert final.json() == winner["view"]
+
+    # ---- 落败者重新读取后按新修订号提交：冲突可恢复，修订号唯一递增 ----
+    retry = client.put(
+        f"/plans/{pid}",
+        json={**loser["payload"], "expected_revision": 1},
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["revision"] == 2
+    assert retry.json()["plan"] == loser["payload"]
+
+    # ---- 随后的计算与采用追溯到确定版本（第 2 版，落败者内容）----
+    c = compute(client, pid)
+    assert c["status"] == "SUCCESS"
+    assert c["plan_revision"] == 2
+    resp = client.post(
+        f"/plans/{pid}/adopt", json={"computation_id": c["computation_id"]}
+    )
+    assert resp.status_code == 200
+    snapshot = resp.json()
+    assert snapshot["plan_revision"] == 2
+    assert snapshot["plan"] == loser["payload"]
+    assert snapshot["result"] == c["result"]
+    assert client.get(f"/plans/{pid}/adoption").json() == snapshot
+
+
+def test_concurrent_overwrite_same_revision_one_wins(client):
+    """两次编辑都先读到修订 1，再各自提交不同内容：恰有一次被接受为
+    修订 2 且响应等于其提交；另一次得到 409 REVISION_CONFLICT
+    （REVISION_MISMATCH），落败写入不得改变方案。随后计算与采用
+    冻结的全部是胜者版本。"""
+    pid = "concurrent-overwrite"
+    put(client, pid, VALID_PLAN)  # 当前修订 1
+
+    # 领先者：条件 UPDATE 已执行并持有行锁，在提交点挂起
+    gate = threading.Event()
+    reached = threading.Event()
+    leader, lout = _save_in_thread(
+        pid,
+        REVISED_PLAN,
+        1,
+        pre_commit=lambda: (reached.set(), gate.wait(timeout=15)),
+    )
+    assert reached.wait(timeout=10), "leader never reached commit point"
+
+    # 落后者此时提交同样基于修订 1 的覆盖：必然阻塞在同一行锁上
+    follower, fout = _save_in_thread(pid, FOLLOWER_PLAN, 1)
+    assert _wait_for_lock_waiter(pid), "follower never blocked on the plan row lock"
+
+    gate.set()
+    leader.join(timeout=20)
+    follower.join(timeout=20)
+    assert not leader.is_alive() and not follower.is_alive(), "worker thread hung"
+
+    # ---- 恰一胜一负：不允许两个 200，也不允许 500 ----
+    assert lout["status"] == 200, lout
+    assert fout["status"] == 409, fout
+    assert fout["code"] == "REVISION_CONFLICT", fout
+    assert [d["code"] for d in fout["details"]] == ["REVISION_MISMATCH"], fout
+
+    # ---- 胜者响应：修订号恰好推进一次（2），内容属于本次提交 ----
+    assert lout["view"]["revision"] == 2
+    assert lout["view"]["plan"] == REVISED_PLAN
+
+    # ---- 落败写入未改变现有方案：最终记录与胜者响应逐项一致，
+    #      落败者的方案内容在任何地方都不可见 ----
+    final = client.get(f"/plans/{pid}")
+    assert final.status_code == 200
+    assert final.json() == lout["view"]
+    assert final.json()["plan"] != FOLLOWER_PLAN
+
+    # ---- 随后计算：冻结修订号 2 与胜者负载 ----
+    c = compute(client, pid)
+    assert c["plan_revision"] == 2
+    # REVISED_PLAN 的最小割：切 p3+p4=6
+    assert c["result"] == {
+        "source_zones": ["MID", "SRC1", "SRC2"],
+        "cut_segments": ["p3", "p4"],
+        "total_cost": 6,
+    }
+    got_c = client.get(f"/plans/{pid}/computations/{c['computation_id']}")
+    assert got_c.status_code == 200
+    assert got_c.json()["plan_revision"] == 2
+    assert got_c.json()["result"] == c["result"]
+
+    # ---- 随后采用：快照与计算冻结版本一致，且与最终采用记录一致 ----
+    resp = client.post(
+        f"/plans/{pid}/adopt", json={"computation_id": c["computation_id"]}
+    )
+    assert resp.status_code == 200
+    snapshot = resp.json()
+    assert snapshot["plan_revision"] == 2
+    assert snapshot["plan"] == REVISED_PLAN
+    assert snapshot["result"] == c["result"]
+    assert client.get(f"/plans/{pid}/adoption").json() == snapshot
+
+    # ---- 落败者重新读取后基于修订 2 重试：属于正常串行编辑，应成功 ----
+    retry = client.put(
+        f"/plans/{pid}",
+        json={**FOLLOWER_PLAN, "expected_revision": 2},
+    )
+    assert retry.status_code == 200
+    assert retry.json()["revision"] == 3
+    assert client.get(f"/plans/{pid}").json() == retry.json()
+
+
+@pytest.mark.parametrize("round_no", range(5))
+def test_parallel_tokenless_overwrite_fuzz(client, round_no):
+    """未携带修订号的并发整版替换（旧语义保持兼容）：两次写入都被接受
+    时修订号必须互不相同，且每个响应的修订号与负载都属于自己的提交；
+    最终记录是修订号较大的那份，任何交错下都不得出现 500。"""
+    pid = f"save-fuzz-{round_no}"
+    put(client, pid, VALID_PLAN)  # 当前修订 1
+
+    # 不做额外协调：任何交错下结果都应成立（行锁把两次原子 +1
+    # 串行化为修订 2 与修订 3）
+    t1, o1 = _save_in_thread(pid, REVISED_PLAN, None)
+    t2, o2 = _save_in_thread(pid, FOLLOWER_PLAN, None)
+    t1.join(timeout=20)
+    t2.join(timeout=20)
+    assert o1["status"] == 200 and o2["status"] == 200, (o1, o2)
+
+    # 两次接受的修订号互不相同，恰好是 {2, 3}（同一行锁串行化两次 +1）
+    assert {o1["view"]["revision"], o2["view"]["revision"]} == {2, 3}, (o1, o2)
+    # 每个响应的负载都是自己提交的内容（内容、修订号、响应一一对应）
+    for outcome in (o1, o2):
+        assert outcome["view"]["plan"] == outcome["payload"]
+    # 最终记录属于修订号较大的那次提交，与该次响应逐项一致
+    later = max(o1, o2, key=lambda o: o["view"]["revision"])
+    assert client.get(f"/plans/{pid}").json() == later["view"]
+
+
+def test_concurrent_overwrite_through_http(client):
+    """端到端：两个并发 HTTP PUT 携带相同 expected_revision，
+    经 FastAPI/线程池/PostgreSQL 后恰一胜一负，错误信封稳定。"""
+    pid = "http-overwrite"
+    put(client, pid, VALID_PLAN)
+
+    results = {}
+    barrier = threading.Barrier(2)
+
+    def http_worker(name, plan):
+        barrier.wait()
+        results[name] = client.put(
+            f"/plans/{pid}",
+            json={**plan, "expected_revision": 1},
+        )
+
+    t1 = threading.Thread(target=http_worker, args=("a", REVISED_PLAN))
+    t2 = threading.Thread(target=http_worker, args=("b", FOLLOWER_PLAN))
+    t1.start()
+    t2.start()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+    assert set(results) == {"a", "b"}
+
+    statuses = {name: resp.status_code for name, resp in results.items()}
+    assert sorted(statuses.values()) == [200, 409], statuses
+    ok = next(resp for resp in results.values() if resp.status_code == 200)
+    bad = next(resp for resp in results.values() if resp.status_code == 409)
+    assert ok.json()["revision"] == 2
+    error = bad.json()["error"]
+    assert error["code"] == "REVISION_CONFLICT"
+    assert {d["code"] for d in error["details"]} == {"REVISION_MISMATCH"}
+
+    # 最终记录即 200 响应；随后计算与采用都指向该版本
+    assert client.get(f"/plans/{pid}").json() == ok.json()
+    c = compute(client, pid)
+    assert c["plan_revision"] == 2
+    resp = client.post(
+        f"/plans/{pid}/adopt", json={"computation_id": c["computation_id"]}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["plan_revision"] == 2
+    assert resp.json()["result"] == c["result"]
+

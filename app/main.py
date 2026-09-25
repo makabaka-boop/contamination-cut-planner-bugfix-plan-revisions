@@ -89,6 +89,37 @@ def _plan_view(plan):
     return {"plan_id": plan.plan_id, "revision": plan.revision, "plan": plan.payload}
 
 
+def _parse_expected_revision(body):
+    """从请求体提取可选的 ``expected_revision``（乐观并发令牌）。
+
+    - 缺省或显式为 null：不声明修订号，沿用"存在则整版替换、否则
+      新建"的旧语义；
+    - 正整数：仅当当前修订号与之相等时才接受整版替换，冲突由持久
+      层原子判定并以 409 REVISION_CONFLICT 返回；
+    - 其他类型/非正数：422 VALIDATION_ERROR（INVALID_EXPECTED_REVISION）。
+    """
+    if not isinstance(body, dict):
+        return None  # 非对象负载由 validate_plan_payload 统一以 422 拒绝
+    if "expected_revision" not in body or body["expected_revision"] is None:
+        return None
+    value = body["expected_revision"]
+    # bool 是 int 的子类，必须显式排除
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "expected_revision must be a positive integer",
+            [
+                {
+                    "code": "INVALID_EXPECTED_REVISION",
+                    "field": "expected_revision",
+                    "message": "expected_revision must be an integer >= 1",
+                }
+            ],
+        )
+    return value
+
+
 def _computation_view(computation):
     return {
         "computation_id": computation.computation_id,
@@ -113,10 +144,21 @@ async def save_plan(
     plan_id: str = Path(pattern=PLAN_ID_REGEX),
     db: Session = Depends(get_db),
 ):
-    """保存（新建或整版替换）方案；非法负载不改写当前方案。"""
-    payload = await _json_body(request)
-    canonical = validate_plan_payload(payload)
-    plan = services.save_plan(db, plan_id, canonical)
+    """保存（新建或整版替换）方案；非法负载不改写当前方案。
+
+    携带 ``expected_revision`` 时仅当当前修订号一致才接受
+    （乐观并发控制），否则返回 409 REVISION_CONFLICT 供调用方
+    重新读取后重试。
+    """
+    body = await _json_body(request)
+    expected_revision = _parse_expected_revision(body)
+    canonical = validate_plan_payload(body)
+    # 阻塞式 psycopg2 写事务（可能等待行锁）放到工作线程执行，
+    # 使并发保存请求能在数据库层真正并行地争锁，由条件 UPDATE /
+    # 唯一约束给出确定结果。
+    plan = await to_thread.run_sync(
+        services.save_plan, db, plan_id, canonical, expected_revision
+    )
     return _plan_view(plan)
 
 
